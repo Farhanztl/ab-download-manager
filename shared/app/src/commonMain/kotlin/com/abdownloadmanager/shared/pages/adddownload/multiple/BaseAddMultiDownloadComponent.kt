@@ -172,6 +172,7 @@ abstract class BaseAddMultiDownloadComponent(
         }
         enqueueCheck(newItemsToAdd)
         this.totalList = this.totalList.plus(newItemsToAdd)
+        this.selectionList = this.selectionList.plus(newItemsToAdd.map { it.getUniqueId() })
     }
 
     var totalList: List<TANewDownloadInputs> by mutableStateOf(emptyList())

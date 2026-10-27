@@ -54,7 +54,15 @@ class WindowsNativeMessagingManifestApplier(json: Json) : NativeMessagingManifes
     private val firefoxManifestFile get() = baseNativeMessagingDir / "firefox" / "${AppInfo.packageName}.json"
     private val chromeManifestFile get() = baseNativeMessagingDir / "chrome" / "${AppInfo.packageName}.json"
     private val firefoxRegistryPath get() = "HKCU\\SOFTWARE\\Mozilla\\NativeMessagingHosts\\${AppInfo.packageName}"
-    private val chromeRegistryPath get() = "HKCU\\SOFTWARE\\Google\\Chrome\\NativeMessagingHosts\\${AppInfo.packageName}"
+    private val chromiumRegistryPaths
+        get() = listOf(
+            "HKCU\\SOFTWARE\\Google\\Chrome\\NativeMessagingHosts\\${AppInfo.packageName}",
+            "HKCU\\SOFTWARE\\Microsoft\\Edge\\NativeMessagingHosts\\${AppInfo.packageName}",
+            "HKCU\\SOFTWARE\\BraveSoftware\\Brave\\NativeMessagingHosts\\${AppInfo.packageName}",
+            "HKCU\\SOFTWARE\\Chromium\\NativeMessagingHosts\\${AppInfo.packageName}",
+            "HKCU\\SOFTWARE\\Vivaldi\\NativeMessagingHosts\\${AppInfo.packageName}",
+            "HKCU\\SOFTWARE\\Opera Software\\Opera Stable\\NativeMessagingHosts\\${AppInfo.packageName}",
+        )
 
     override fun updateManifests(
         manifests: NativeMessagingManifests
@@ -67,11 +75,14 @@ class WindowsNativeMessagingManifestApplier(json: Json) : NativeMessagingManifes
         )
 
         writeManifestContent(chromeManifestFile, serialize(manifests.chromeNativeMessagingManifest))
-        WindowsRegistry.setValueInRegistry(
-            path = chromeRegistryPath,
-            key = null,
-            value = chromeManifestFile.toString()
-        )
+        val chromeManifestPath = chromeManifestFile.toString()
+        chromiumRegistryPaths.forEach { registryPath ->
+            WindowsRegistry.setValueInRegistry(
+                path = registryPath,
+                key = null,
+                value = chromeManifestPath
+            )
+        }
     }
 
     override fun removeManifests() {
@@ -80,9 +91,11 @@ class WindowsNativeMessagingManifestApplier(json: Json) : NativeMessagingManifes
             path = firefoxRegistryPath,
         )
         chromeManifestFile.deleteIfExists()
-        WindowsRegistry.removePathInRegistry(
-            path = chromeRegistryPath,
-        )
+        chromiumRegistryPaths.forEach { registryPath ->
+            WindowsRegistry.removePathInRegistry(
+                path = registryPath,
+            )
+        }
     }
 
 }
