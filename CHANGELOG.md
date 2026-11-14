@@ -12,7 +12,16 @@
 
 ### Fixed
 
+- A damaged categories or queue file no longer silently replaces your categories / main queue with empty defaults; it's kept next to the original as `*.corrupt-<timestamp>` and the problem is logged
+- Failures while saving or reading download state files are now logged instead of being ignored
+- Possible lost updates when jobs are created or removed at the same time, and download events being dropped silently when many downloads change at once
+- A queue could stay unable to start after a failure while stopping it
+
 ### Security
+
+- Local API now rejects requests that come from web pages (requests with an `Origin` other than a browser extension, or with a `Host` other than `127.0.0.1` / `localhost`), so a web page can't make the app download files through it
+- Local API: when API authentication is disabled, `/start-headless-download` only accepts the default download folder and category folders
+- API key is now generated using a cryptographically secure random generator and compared in constant time
 
 ## 1.11.1
 
