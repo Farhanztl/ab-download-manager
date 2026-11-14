@@ -11,6 +11,7 @@ import ir.amirab.downloader.utils.swap
 import ir.amirab.downloader.utils.swapped
 import ir.amirab.util.coroutines.debounce
 import ir.amirab.util.guardedEntry
+import ir.amirab.util.logger.appLogger
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlin.time.Duration.Companion.milliseconds
@@ -43,6 +44,13 @@ class DownloadQueue(
     private val scheduleTimes: ScheduleTimes
         get() = getQueueModel().scheduledTimes
 
+    /**
+     * Guards [activeItems], [canceledItems] and [trimmedItems].
+     * They are touched from several threads: the download events listener, the debounced shake,
+     * the coroutines that start/stop the queue and the callers of the public functions (UI).
+     * Never call something that blocks or waits for other coroutines while holding it.
+     */
+    private val stateLock = Any()
     private val activeItems = mutableSetOf<Long>()
     private val canceledItems = mutableSetOf<Long>()
     private val trimmedItems = mutableSetOf<Long>()
@@ -84,11 +92,14 @@ class DownloadQueue(
     }
 
     private fun onDownloadCanceled(id: Long, e: Throwable) {
-        val removed = activeItems.remove(id)
-        if (isQueueActive) {
-            if (!trimmedItems.remove(id)) {
-                canceledItems.add(id)
+        val removed = synchronized(stateLock) {
+            val wasActive = activeItems.remove(id)
+            if (isQueueActive) {
+                if (!trimmedItems.remove(id)) {
+                    canceledItems.add(id)
+                }
             }
+            wasActive
         }
         shake(
             itemChangeHappened = removed,
@@ -106,14 +117,16 @@ class DownloadQueue(
     fun start() {
         if (stopping) return
 //        println("on start queue")
-        canceledItems.clear()
-        trimmedItems.clear()
         ensureBooted()
-        setActive(true)
+        synchronized(stateLock) {
+            canceledItems.clear()
+            trimmedItems.clear()
+            setActive(true)
 //        println("starting")
-        shake(
-            delayed = false
-        )
+            shake(
+                delayed = false
+            )
+        }
         return
     }
 
@@ -136,9 +149,9 @@ class DownloadQueue(
 
     private fun actualShake(
         itemChangeHappened: Boolean = false
-    ): Boolean {
+    ): Boolean = synchronized(stateLock) {
 //        println("shake queue")
-        return when {
+        when {
             !isQueueActive -> false
             activeItems.isEmpty() && (getDownloadableItemFromQueue() == null) -> {
                 if (stopQueueOnEmpty) {
@@ -263,22 +276,30 @@ class DownloadQueue(
     @Volatile
     var stopping = false
     suspend fun stopAsync() {
-        if (stopping) return
-        setActive(false)
-        stopping = true
-        //active item is a synchronized list so we should iterate over it FAST!
-        val stopJobs = activeItems.map {
-            scope.async {
-                downloadEvents.stopJob(it, StoppedBy(me))
+        synchronized(stateLock) {
+            // check and set must be atomic otherwise two callers can both stop the queue
+            if (stopping) return
+            setActive(false)
+            stopping = true
+        }
+        try {
+            // take a snapshot, activeItems changes while the jobs are stopping (their cancel events remove them)
+            val itemsToStop = synchronized(stateLock) { activeItems.toList() }
+            val stopJobs = itemsToStop.map {
+                scope.async {
+                    downloadEvents.stopJob(it, StoppedBy(me))
+                }
             }
-        }
-        kotlin.runCatching {
             stopJobs.awaitAll()
-        }.onFailure {
-            // should not happen!
-//            it.printStackTrace()
+        } catch (e: Exception) {
+            // a failure of stopping one of the jobs should not leave the queue in the stopping state
+            // but if *we* were cancelled we must not continue
+            currentCoroutineContext().ensureActive()
+            appLogger.w(e) { "Failed to stop some downloads of queue $id" }
+        } finally {
+            // must always be reset otherwise start() ignores all next calls
+            stopping = false
         }
-        stopping = false
     }
 
 
@@ -390,6 +411,7 @@ class DownloadQueue(
     }
 
 
+    // trim, extend and the functions they use must be called with [stateLock] held (from actualShake)
     private fun trim() {
         val count = activeItems.size - maxConcurrent
         repeat(count) {
@@ -494,23 +516,29 @@ class DownloadQueue(
         _queueModel.update {
             it.copy(queueItems = emptyList())
         }
-        activeItems.clear()
-        canceledItems.clear()
-        trimmedItems.clear()
+        synchronized(stateLock) {
+            activeItems.clear()
+            canceledItems.clear()
+            trimmedItems.clear()
+        }
     }
 
     fun removeFromQueue(ids: List<Long>) {
+        // list.contains is O(n) and this runs for every item
+        val idsToRemove = ids.toSet()
         _queueModel.update {
             it.copy(
                 queueItems = it.queueItems.filter {
-                    it !in ids
+                    it !in idsToRemove
                 }.distinct()
             )
         }
-        for (id in ids) {
-            activeItems.remove(id)
-            canceledItems.remove(id)
-            trimmedItems.remove(id)
+        synchronized(stateLock) {
+            for (id in idsToRemove) {
+                activeItems.remove(id)
+                canceledItems.remove(id)
+                trimmedItems.remove(id)
+            }
         }
     }
 

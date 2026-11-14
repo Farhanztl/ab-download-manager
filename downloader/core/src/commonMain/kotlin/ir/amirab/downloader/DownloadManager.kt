@@ -14,11 +14,14 @@ import ir.amirab.downloader.utils.FileNameUtil
 import ir.amirab.downloader.utils.OnDuplicateStrategy.*
 import ir.amirab.util.FileNameValidator
 import ir.amirab.util.PathValidator
+import ir.amirab.util.logger.appLogger
 import ir.amirab.util.suspendGuardedEntry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -26,6 +29,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import ir.amirab.downloader.utils.speedlimiter.SpeedLimiter
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 class DownloadManager(
     val dlListDb: IDownloadListDb,
@@ -60,6 +65,9 @@ class DownloadManager(
         }
     }
 
+    // copy on write list: readers (the monitor, queues, ...) use whatever snapshot they see without locking,
+    // writers must hold [jobModificationLock]
+    @Volatile
     var downloadJobs = listOf<DownloadJob>()
         private set
 
@@ -142,14 +150,25 @@ class DownloadManager(
     }
 
     private val jobModificationLock = Any()
+
+    /**
+     * Creates a job for this item and registers it.
+     * If a job for this item is already registered it is returned instead,
+     * (so two concurrent callers can't end up with two jobs downloading the same item).
+     */
     private fun createJob(downloadItem: IDownloadItem): DownloadJob {
-        val job = downloaderRegistry.createJob(
-            downloadItem,
-            this,
-        )
+        synchronized(jobModificationLock) {
+            downloadJobs.find { it.id == downloadItem.id }?.let {
+                return it
+            }
+            val job = downloaderRegistry.createJob(
+                downloadItem,
+                this,
+            )
 //        thisLogger().info("download job for $id created")
-        downloadJobs = downloadJobs + job
-        return job
+            downloadJobs = downloadJobs + job
+            return job
+        }
     }
 
     suspend fun deleteDownload(
@@ -157,7 +176,12 @@ class DownloadManager(
         alsoRemoveFile: (IDownloadItem) -> Boolean,
         context: DownloadItemContext = EmptyContext,
     ) {
-        kotlin.runCatching { pause(id) }
+        try {
+            pause(id)
+        } catch (e: Exception) {
+            // we are going to delete it anyway, but if *we* were cancelled we must not continue
+            currentCoroutineContext().ensureActive()
+        }
         val itemToDelete = dlListDb.getById(id) ?: return
         val job = getDownloadJob(id) ?: run {
             createJob(itemToDelete).apply { boot() }
@@ -175,7 +199,7 @@ class DownloadManager(
         deleteJob(job.id)
         dlListDb.remove(itemToDelete)
         partListDb.removeParts(id)
-        listOfJobsEvents.tryEmit(
+        emitEvent(
             DownloadManagerEvents.OnJobRemoved(itemToDelete, contextContainer.getContext(id))
         )
         contextContainer.removeContext(id)
@@ -243,7 +267,7 @@ class DownloadManager(
     }
 
     fun onDownloadResuming(downloadItem: IDownloadItem) {
-        listOfJobsEvents.tryEmit(
+        emitEvent(
             DownloadManagerEvents.OnJobStarting(
                 downloadItem,
                 contextContainer.getContext(downloadItem.id)
@@ -252,7 +276,7 @@ class DownloadManager(
     }
 
     fun onDownloadResumed(downloadItem: IDownloadItem) {
-        listOfJobsEvents.tryEmit(
+        emitEvent(
             DownloadManagerEvents.OnJobStarted(
                 downloadItem,
                 contextContainer.getContext(downloadItem.id)
@@ -261,7 +285,7 @@ class DownloadManager(
     }
 
     fun onDownloadAdded(downloadItem: IDownloadItem) {
-        listOfJobsEvents.tryEmit(
+        emitEvent(
             DownloadManagerEvents.OnJobAdded(
                 downloadItem,
                 contextContainer.getContext(downloadItem.id)
@@ -270,7 +294,7 @@ class DownloadManager(
     }
 
     fun onDownloadCanceled(downloadItem: IDownloadItem, throwable: Throwable) {
-        listOfJobsEvents.tryEmit(
+        emitEvent(
             DownloadManagerEvents.OnJobCanceled(
                 downloadItem,
                 contextContainer.getContext(downloadItem.id), throwable
@@ -280,7 +304,7 @@ class DownloadManager(
 
     fun onDownloadFinished(downloadItem: IDownloadItem) {
         scope.launch {
-            listOfJobsEvents.tryEmit(
+            emitEvent(
                 DownloadManagerEvents.OnJobCompleted(
                     downloadItem,
                     contextContainer.getContext(downloadItem.id)
@@ -292,7 +316,7 @@ class DownloadManager(
 
     fun onDownloadItemChange(downloadItem: IDownloadItem) {
         scope.launch {
-            listOfJobsEvents.tryEmit(
+            emitEvent(
                 DownloadManagerEvents.OnJobChanged(
                     downloadItem,
                     contextContainer.getContext(downloadItem.id)
@@ -344,8 +368,26 @@ class DownloadManager(
         }?.status?.value
     }
 
+    // Listeners (queues, monitor, UI ...) rely on these events to stay in sync (e.g. a queue frees its slot on completion).
+    // The buffer must be big enough to absorb bursts (e.g. stopping a lot of downloads at once) while a listener is busy.
     override val listOfJobsEvents: MutableSharedFlow<DownloadManagerEvents> =
-        MutableSharedFlow(extraBufferCapacity = 64)
+        MutableSharedFlow(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
+
+    private val _droppedEventCount = AtomicLong(0)
+
+    /** how many events we couldn't deliver because the buffer was full. It should always be 0. */
+    val droppedEventCount: Long get() = _droppedEventCount.get()
+
+    private fun emitEvent(event: DownloadManagerEvents) {
+        // tryEmit only fails when the buffer is full. In that case, the event is lost for every listener,
+        // that must be visible.
+        if (!listOfJobsEvents.tryEmit(event)) {
+            _droppedEventCount.incrementAndGet()
+            appLogger.w {
+                "Download event buffer is full! dropped ${event::class.simpleName} of download ${event.downloadItem.id}"
+            }
+        }
+    }
 
     //global speed limiter
     internal val speedLimiter = SpeedLimiter()
@@ -380,10 +422,14 @@ class DownloadManager(
 
 }
 
+/**
+ * contexts are read and written from many threads (jobs, queues, UI actions) so it must be thread safe.
+ * an item without a (meaningful) context has no entry.
+ */
 private class ContextProvider {
-    val contexts = mutableMapOf<Long, DownloadItemContext>()
+    private val contexts = ConcurrentHashMap<Long, DownloadItemContext>()
     fun getContext(id: Long): DownloadItemContext {
-        return contexts.getOrDefault(id, EmptyContext)
+        return contexts[id] ?: EmptyContext
     }
 
     fun setContext(id: Long, context: DownloadItemContext) {
@@ -399,6 +445,11 @@ private class ContextProvider {
     }
 
     fun updateContext(id: Long, block: (DownloadItemContext) -> DownloadItemContext) {
-        setContext(id, getContext(id).let(block))
+        // atomic read-modify-write. returning null removes the entry
+        contexts.compute(id) { _, current ->
+            block(current ?: EmptyContext).takeIf { it != EmptyContext }
+        }
     }
 }
+
+private const val EVENT_BUFFER_CAPACITY = 1024
