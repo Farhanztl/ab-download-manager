@@ -1,5 +1,6 @@
 package ir.amirab.downloader.db
 
+import ir.amirab.util.logger.appLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -39,22 +40,37 @@ class DownloadQueueFileStorageDatabase(
         }
     }
 
+    /**
+     * @return null if the queue doesn't exist or its file is unusable.
+     * An unusable file is set aside (not deleted): the queue manager recreates a missing main queue
+     * and that would silently overwrite the only copy of the user's queue.
+     */
+    private fun readQueue(queueId: Long): QueueModel? {
+        val file = getFileOfQueue(queueId)
+        return when (val result = fileSaver.read<QueueModel>(file)) {
+            is FileReadResult.Ok -> result.value
+            FileReadResult.Missing -> null
+            is FileReadResult.Failure -> {
+                appLogger.e(result.cause) { "Queue file ${file.path} is not usable. Skipping this queue" }
+                fileSaver.quarantine(file)
+                null
+            }
+        }
+    }
+
     override suspend fun getQueue(queueId: Long): QueueModel {
         return withContext(Dispatchers.IO) {
-            requireNotNull(fileSaver.readObject(
-                getFileOfQueue(queueId)
-            )
-            ) {
+            requireNotNull(readQueue(queueId)) {
                 "Queue with $queueId returned null"
             }
         }
     }
 
     override suspend fun getAllQueues(): List<QueueModel> {
-        return getAllQueueIds().mapNotNull {
-            kotlin.runCatching {
-                getQueue(it)
-            }.getOrNull()
+        return withContext(Dispatchers.IO) {
+            getAllQueueIds().mapNotNull {
+                readQueue(it)
+            }
         }
     }
 

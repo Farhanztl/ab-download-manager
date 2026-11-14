@@ -95,12 +95,13 @@ class DownloadListFileStorage(
     }
 
     private fun getLastIdFromFiles(): Long {
-        return downloadListFolder.listFiles()!!.filter {
+        // ignore anything that is not named like "<id>.json" (same as getAll does)
+        return downloadListFolder.listFiles().orEmpty().filter {
             it.name.endsWith(".json") && it.isFile
-        }.maxOfOrNull {
+        }.mapNotNull {
             it.name
-                .substring(0, it.name.length - ".json".length)
-                .toLong()
-        } ?: -1L
+                .removeSuffix(".json")
+                .toLongOrNull()
+        }.maxOrNull() ?: -1L
     }
 }
