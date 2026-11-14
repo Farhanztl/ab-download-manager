@@ -3,6 +3,7 @@ package com.abdownloadmanager.integration
 import com.abdownloadmanager.integration.model.AddDownloadsFromIntegration
 import com.abdownloadmanager.integration.model.ApiQueueModel
 import com.abdownloadmanager.integration.model.NewDownloadTask
+import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.install
 import io.ktor.server.auth.Authentication
@@ -15,6 +16,7 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import java.security.MessageDigest
 
 private data class AppPrincipal(val key: String)
 
@@ -24,10 +26,13 @@ internal fun Application.setupRouting(
     settings: IntegrationSettings,
 ) {
     val apiKey = settings.apiKey
+    // must be first: it protects every route, including the ones that don't need an api key
+    installRequestGuard()
     install(Authentication) {
         apiKey {
             validate { receivedKey ->
-                if (receivedKey == apiKey) {
+                // constant time comparison
+                if (apiKey != null && MessageDigest.isEqual(receivedKey.toByteArray(), apiKey.toByteArray())) {
                     AppPrincipal(receivedKey)
                 } else null
             }
@@ -68,7 +73,14 @@ internal fun Application.setupRouting(
                     json.decodeFromString<NewDownloadTask>(message)
                 }
                 itemsToAdd.onFailure { it.printStackTrace() }
-                integrationHandler.addDownload(itemsToAdd.getOrThrow())
+                val task = itemsToAdd.getOrThrow()
+                try {
+                    // without an api key anyone who can reach this port is "the caller"
+                    integrationHandler.addDownload(task, isTrustedCaller = apiKey != null)
+                } catch (e: IntegrationRequestRejectedException) {
+                    call.respondText(e.message.orEmpty(), status = HttpStatusCode.Forbidden)
+                    return@post
+                }
                 call.respondText("OK")
             }
             post("/ping") {

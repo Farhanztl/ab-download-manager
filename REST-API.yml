@@ -85,7 +85,11 @@ paths:
                       description: Optional download page URL
                 folder:
                   type: string
-                  description: Optional folder to save the download (Unix style path)
+                  description: >-
+                    Optional folder to save the download (Unix style path).
+                    When API authentication is disabled, only the default download folder, the category folders
+                    and their sub folders are accepted (other folders get a 403 response).
+                    Enable API authentication and send the API key to use any folder.
                 name:
                   type: string
                   description: Optional name for the download task

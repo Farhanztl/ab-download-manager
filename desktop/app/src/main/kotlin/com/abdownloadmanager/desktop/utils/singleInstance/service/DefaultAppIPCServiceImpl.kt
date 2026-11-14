@@ -31,7 +31,8 @@ class DefaultAppIPCServiceImpl : IDefaultAppIPCService, KoinComponent {
 
     override suspend fun addDownload(request: NewDownloadTask): Long {
         awaitAppBoot()
-        return integrationHandler.addDownload(request)
+        // this is how the cli of the user talks to the running app
+        return integrationHandler.addDownload(request, isTrustedCaller = true)
     }
 
     override suspend fun pauseDownload(ids: List<Long>) {

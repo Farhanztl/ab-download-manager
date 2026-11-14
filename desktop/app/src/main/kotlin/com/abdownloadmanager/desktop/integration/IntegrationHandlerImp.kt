@@ -3,6 +3,7 @@ package com.abdownloadmanager.desktop.integration
 import com.abdownloadmanager.desktop.AppComponent
 import com.abdownloadmanager.desktop.repository.AppRepository
 import com.abdownloadmanager.integration.IntegrationHandler
+import com.abdownloadmanager.integration.IntegrationRequestRejectedException
 import com.abdownloadmanager.integration.model.*
 import com.abdownloadmanager.shared.downloaderinui.BasicDownloadItem
 import com.abdownloadmanager.shared.downloaderinui.DownloaderInUiRegistry
@@ -10,12 +11,14 @@ import com.abdownloadmanager.shared.pages.adddownload.AddDownloadCredentialsInUi
 import com.abdownloadmanager.shared.pages.adddownload.ImportOptions
 import com.abdownloadmanager.shared.pages.adddownload.SilentImportOptions
 import com.abdownloadmanager.shared.util.DownloadSystem
+import com.abdownloadmanager.shared.util.category.CategoryManager
 import ir.amirab.downloader.NewDownloadItemProps
 import ir.amirab.downloader.downloaditem.EmptyContext
 import ir.amirab.downloader.downloaditem.hls.HLSDownloadCredentials
 import ir.amirab.downloader.downloaditem.http.HttpDownloadCredentials
 import ir.amirab.downloader.queue.QueueManager
 import ir.amirab.downloader.utils.OnDuplicateStrategy
+import ir.amirab.util.PathValidator
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 
@@ -25,6 +28,7 @@ class IntegrationHandlerImp : IntegrationHandler, KoinComponent {
     val queueManager by inject<QueueManager>()
     val appSettings by inject<AppRepository>()
     private val downloaderInUiRegistry by inject<DownloaderInUiRegistry>()
+    private val categoryManager by inject<CategoryManager>()
 
     override suspend fun addDownloadByGui(
         request: AddDownloadsFromIntegration
@@ -52,7 +56,30 @@ class IntegrationHandlerImp : IntegrationHandler, KoinComponent {
         }
     }
 
-    override suspend fun addDownload(task: NewDownloadTask): Long {
+    /**
+     * Folders that a caller we can't trust is allowed to use:
+     * the default download folder and the folders of the categories (the user chose them).
+     */
+    private fun getAllowedFoldersForUntrustedCallers(): List<String> {
+        return buildList {
+            add(appSettings.saveLocation.value)
+            categoryManager.getCategories().mapNotNullTo(this) {
+                it.getDownloadPath()
+            }
+        }
+    }
+
+    override suspend fun addDownload(task: NewDownloadTask, isTrustedCaller: Boolean): Long {
+        val requestedFolder = task.folder
+        if (!isTrustedCaller && requestedFolder != null) {
+            if (!PathValidator.isInsideAny(requestedFolder, getAllowedFoldersForUntrustedCallers())) {
+                throw IntegrationRequestRejectedException(
+                    "folder is not allowed. " +
+                            "Use the default download folder (or a category folder) " +
+                            "or enable the API authentication and send the key to use other folders."
+                )
+            }
+        }
         val addDownloaderInUiProps = convertToDownloadSystemCredentials(task.downloadSource)
         val downloaderInUi = downloaderInUiRegistry.getDownloaderOf(
             addDownloaderInUiProps.credentials
